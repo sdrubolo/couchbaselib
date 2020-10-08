@@ -8,6 +8,7 @@ module Couchbase
   , LcbStoreOperation(..)
   , LcbStore(..)
   , StoreOpts(..)
+  , LcbValueOf(..)
   , lcbCreate
   , lcbConnect
   , lcbStore
@@ -24,7 +25,7 @@ import           Foreign.Marshal.Alloc
 import           Foreign.Marshal.Utils
 import           Foreign.C.String
 
-import           Data.ByteString
+import qualified Data.ByteString               as B
 import           LcbStatus
 import           Debug.Trace
 import           GHC.TypeLits                   ( TypeError(..)
@@ -58,7 +59,8 @@ instance Storable LcbResponse where
 data LcbWaitFlags = LcbWaitDefault | LcbWaitNoCheck
   deriving (Show,Eq)
 
-
+class LcbValueOf a where
+  valueOf :: a -> B.ByteString
 
 data LcbStoreOperation = LcbUpsert
                        | LcbInsert
@@ -68,14 +70,13 @@ data LcbStoreOperation = LcbUpsert
   deriving (Show,Eq)
 
 type Key = String
-type Value = String
 
 data StoreOpts = StoreOpts {
   cas :: Maybe Int,
   exptime :: Maybe Int
 }
 
-data LcbStore = LcbStore LcbStoreOperation StoreOpts Key Value
+data LcbStore a = LcbStore LcbStoreOperation StoreOpts Key a
 
 
 instance Enum LcbWaitFlags where
@@ -162,7 +163,6 @@ instance Enum CB_BucketType where
   toEnum 1 = LcbTypeCluster
   toEnum unmatched = error ("CB_BucketType.toEnum: Cannot match " ++ show unmatched)
 
-
 newtype LcbInstance = LcbInstance (ForeignPtr LcbInstance)
 type LcbOps = Ptr ()
 type LcbCommand = Ptr ()
@@ -212,12 +212,12 @@ lcbAddExpTime :: Ptr () -> Maybe Int -> IO LcbStatus
 lcbAddExpTime _      Nothing  = return LcbSuccess
 lcbAddExpTime ptrCmd (Just x) = lcbToStatus <$> c_lcbCmdstoreExpiry ptrCmd (fromIntegral $ fromEnum x)
 
-lcbStore :: LcbInstance -> LcbStore -> IO LcbStatus
+lcbStore :: (LcbValueOf a) => LcbInstance -> LcbStore a -> IO LcbStatus
 lcbStore (LcbInstance lcbInstance) (LcbStore op opts key value) = allocaBytes 152 $ \ptrCmd -> do
   fillBytes ptrCmd 0 152
   (\ptr val -> pokeByteOff ptr 136 (val :: CInt)) ptrCmd $ fromIntegral $ fromEnum $ op
   withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdstoreKey ptrCmd _key (toEnum _key_len)
-  withCAStringLen value $ \(_value, _value_len) -> c_lcbCmdstoreValue ptrCmd _value (toEnum _value_len)
+  B.useAsCStringLen (valueOf value) $ \(_value, _value_len) -> c_lcbCmdstoreValue ptrCmd _value (toEnum _value_len)
   casResponse <- lcbAddCas ptrCmd (cas opts)
   lcbAddExpTime ptrCmd (exptime opts)
   case casResponse of
@@ -228,16 +228,16 @@ lcbStore (LcbInstance lcbInstance) (LcbStore op opts key value) = allocaBytes 15
       return $ lcbToStatus status
     any -> return any
 
-lcbGet :: LcbInstance -> String -> IO (Either LcbStatus ByteString)
+lcbGet :: LcbInstance -> String -> IO (Either LcbStatus B.ByteString)
 lcbGet (LcbInstance lcbInstance) key = allocaBytes 112 $ \ptrCmd -> do
   fillBytes ptrCmd 0 112
   withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
   allocaBytes 24 $ \responseInfo -> do
     fillBytes responseInfo 0 24
     withForeignPtr lcbInstance $ \prt -> c_lcbGetWrapper prt ptrCmd responseInfo
-    LcbResponse status _ _ value <- peek responseInfo
+    LcbResponse status _ length value <- peek responseInfo
     case (lcbToStatus status) of
-      LcbSuccess -> Right <$> packCString value
+      LcbSuccess -> Right <$> B.packCStringLen (value, fromEnum length)
       any        -> return $ Left any
 
 

@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# HLINT ignore "Redundant do" #-}
+
 module Main where
 
 
@@ -15,10 +17,12 @@ import           Control.Concurrent
 import qualified Data.Text                     as T
 import           Data.Text.Encoding             ( encodeUtf8 )
 
-toString :: String -> B.ByteString
-toString = encodeUtf8 . T.pack
 
+instance LcbValueOf [Char] where
+  valueOf = encodeUtf8 . T.pack
 
+instance LcbValueOf Int where
+  valueOf = valueOf . show
 
 defaultParams :: CBConnect
 defaultParams = cbConnect "gianluca" "qwerty12345" "couchbase://localhost/test"
@@ -59,17 +63,17 @@ main = hspec $ do
   describe "upsert" $ do
     context "when key and value is provided" $ do
       it "should add the element" $ do
-        withConnection $ \connection ->
-          lcbStore connection
-                   (LcbStore LcbUpsert (emptyStoreOpts { cas = Nothing }) "test" "{ 'value' : 'test', 'type' : 'test4' }")
-            `shouldReturn` LcbSuccess
+        withConnection $ \connection -> do
+          let op =
+                LcbStore LcbUpsert (emptyStoreOpts { cas = Nothing }) "test" "{ \"value\" : \"test\", \"type\" : \"test4\" }"
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
 
     context "when cas is valued" $ do
       it "should add the element" $ do
-        withConnection $ \connection ->
-          lcbStore connection
-                   (LcbStore LcbUpsert (emptyStoreOpts { cas = Just 1 }) "test" "{ 'value' : 'test', 'type' : 'test4' }")
-            `shouldReturn` LcbErrInvalidArgument
+        withConnection $ \connection -> do
+          let op =
+                LcbStore LcbUpsert (emptyStoreOpts { cas = Just 1 }) "test" "{ \"value\" : \"test\", \"type\" : \"test4\" }"
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbErrInvalidArgument
 
   describe "insert" $ do
 
@@ -77,34 +81,61 @@ main = hspec $ do
       it "should add the element" $ do
         withConnection $ \connection -> do
           randomKey <- randomWord randomASCII 20
-          lcbStore
-              connection
-              (LcbStore LcbInsert (emptyStoreOpts { cas = Nothing }) randomKey "{ 'value' : 'test', 'type' : 'test2' }")
-            `shouldReturn` LcbSuccess
+          let
+            op = LcbStore LcbInsert
+                          (emptyStoreOpts { cas = Nothing })
+                          randomKey
+                          "{ \"value\" : \"test\", \"type\" : \"test2\" }"
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
 
     context "when adding twice value with same key" $ do
       it "should fail" $ do
         withConnection $ \connection -> do
           randomKey <- randomWord randomASCII 20
-          let op = LcbStore LcbInsert (emptyStoreOpts { cas = Nothing }) randomKey "{ 'value' : 'test', 'type' : 'test3' }"
-          lcbStore connection op `shouldReturn` LcbSuccess
-          --threadDelay 6000000
-          lcbStore connection op `shouldReturn` LcbErrDocumentExists
+          let
+            op = LcbStore LcbInsert
+                          (emptyStoreOpts { cas = Nothing })
+                          randomKey
+                          "{ \"value\" : \"test\", \"type\" : \"test3\" }"
+            op2 = LcbStore LcbInsert (emptyStoreOpts { cas = Nothing }) randomKey 1
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
+          lcbStore connection (op2 :: LcbStore Int) `shouldReturn` LcbErrDocumentExists
 
     context "when cas is valued" $ do
       it "should add the element" $ do
-        withConnection $ \connection ->
-          lcbStore connection
-                   (LcbStore LcbInsert (emptyStoreOpts { cas = Just 1 }) "test" "{ 'value' : 'test', 'type' : 'test4' }")
-            `shouldReturn` LcbErrInvalidArgument
+        withConnection $ \connection -> do
+          let op =
+                LcbStore LcbInsert (emptyStoreOpts { cas = Just 1 }) "test" "{ \"value\" : \"test\", \"type\" : \"test4\" }"
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbErrInvalidArgument
 
   describe "get" $ do
 
     context "when an existing key is provided" $ do
       it "should retrun the element" $ do
         withConnection $ \connection -> do
-          let value = "{ 'value' : 'test', 'type' : 'test2' }"
           randomKey <- randomWord randomASCII 20
-          lcbStore connection (LcbStore LcbInsert (emptyStoreOpts { cas = Nothing }) randomKey value)
-            `shouldReturn` LcbSuccess
-          lcbGet connection randomKey `shouldReturn` (Right $ toString value)
+          let value = "{ \"value\" : \"test\", \"type\" : \"test2\" }"
+              op    = LcbStore LcbInsert (emptyStoreOpts { cas = Nothing }) randomKey value
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
+          lcbGet connection randomKey `shouldReturn` (Right $ valueOf value)
+
+  describe "expire" $ do
+
+    let value = "{ \"value\" : \"test\", \"type\" : \"test2\" }"
+
+    context "when a document with expire time is create" $ do
+      it "should not be found if the time exceed the exptime" $ do
+        withConnection $ \connection -> do
+          randomKey <- randomWord randomASCII 20
+          let op = LcbStore LcbInsert (emptyStoreOpts { cas = Nothing, exptime = Just 5 }) randomKey value
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
+          threadDelay 6000000
+          lcbGet connection randomKey `shouldReturn` (Left LcbErrDocumentNotFound)
+
+      it "should be found if the time does not exceed the exptime" $ do
+        withConnection $ \connection -> do
+          randomKey <- randomWord randomASCII 20
+          let op = LcbStore LcbInsert (emptyStoreOpts { cas = Nothing, exptime = Just 5 }) randomKey value
+          lcbStore connection (op :: LcbStore String) `shouldReturn` LcbSuccess
+          threadDelay 3000000
+          lcbGet connection randomKey `shouldReturn` (Right $ valueOf value)
