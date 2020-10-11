@@ -1,6 +1,5 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE TypeFamilies#-}
-
+{-# LANGUAGE TupleSections #-}
 
 module Couchbase
   ( CBConnect(..)
@@ -13,6 +12,9 @@ module Couchbase
   , lcbConnect
   , lcbStore
   , lcbGet
+  , lcbRemove
+  , lcbTouch
+  , lcbCounter
   )
 where
 
@@ -32,29 +34,29 @@ import           GHC.TypeLits                   ( TypeError(..)
                                                 , ErrorMessage(..)
                                                 )
 
-
-
 data CB_BucketType = LcbTypeBucket
                    | LcbTypeCluster
   deriving (Show,Eq)
 
-data LcbResponse = LcbResponse CInt CUInt CUInt CString
+data LcbResponseRaw = LcbResponseRaw CInt CULong CUInt CString CULong
   deriving (Show, Eq)
 
-instance Storable LcbResponse where
-  sizeOf _ = 32
+instance Storable LcbResponseRaw where
+  sizeOf _ = 40
   alignment = sizeOf
   peek ptr = do
     a <- peekByteOff ptr 0
     b <- peekByteOff ptr 8
     c <- peekByteOff ptr 16
     d <- peekByteOff ptr 24
-    return (LcbResponse a b c d)
-  pokeElemOff p i (LcbResponse a b c d) = do
+    e <- peekByteOff ptr 32
+    return (LcbResponseRaw a b c d e)
+  pokeElemOff p i (LcbResponseRaw a b c d e) = do
     pokeElemOff (castPtr p) i a
     pokeElemOff (castPtr p) (i+8) b
     pokeElemOff (castPtr p) (i+16) c
     pokeElemOff (castPtr p) (i+24) d
+    pokeElemOff (castPtr p) (i+32) e
 
 data LcbWaitFlags = LcbWaitDefault | LcbWaitNoCheck
   deriving (Show,Eq)
@@ -164,6 +166,7 @@ instance Enum CB_BucketType where
   toEnum unmatched = error ("CB_BucketType.toEnum: Cannot match " ++ show unmatched)
 
 newtype LcbInstance = LcbInstance (ForeignPtr LcbInstance)
+  deriving (Show, Eq)
 type LcbOps = Ptr ()
 type LcbCommand = Ptr ()
 
@@ -181,9 +184,13 @@ data CBConnect = CBConnect {
     cb_connection :: String
 }
 
+type LcbResponse = (Int,Maybe B.ByteString)
+
+responseInfoSize = sizeOf (undefined :: LcbResponseRaw)
+
 lcbToStatus = toEnum . fromIntegral
 
-lcbCreate :: CBConnect -> IO (LcbStatus, LcbInstance)
+lcbCreate :: CBConnect -> IO (Either LcbStatus LcbInstance)
 lcbCreate params = allocaBytes 96 $ \st -> do
   fillBytes st 0 96
   (\ptr val -> pokeByteOff ptr 0 (val :: CInt)) st $ fromIntegral $ fromEnum $ cb_bucket_type params
@@ -191,55 +198,93 @@ lcbCreate params = allocaBytes 96 $ \st -> do
   withCAStringLen (cb_password params) $ \(password, password_len) ->
     withCAStringLen (cb_username params) $ \(username, username_len) ->
       c_lcbCreateoptsCredentials st username (toEnum username_len) password (toEnum password_len)
-  c_lcbCreate st
+  (status, lcbInstance) <- c_lcbCreate st
+  return $ case status of
+    LcbSuccess -> Right lcbInstance
+    any        -> Left any
 
-lcbConnect :: LcbInstance -> IO LcbStatus
-lcbConnect (LcbInstance lcbInstance) = withForeignPtr lcbInstance $ \prt -> do
+lcbConnect :: LcbInstance -> IO (Either LcbStatus LcbInstance)
+lcbConnect i@(LcbInstance lcbInstance) = withForeignPtr lcbInstance $ \prt -> do
   status <- (toEnum . fromIntegral) <$> c_lcbConnect'_ prt
   case status of
     LcbSuccess -> do
       waitStatus <- c_lcbWait prt (fromIntegral $ fromEnum LcbWaitNoCheck)
       case lcbToStatus waitStatus of
-        LcbSuccess -> lcbToStatus <$> c_lcbInitWrapper prt
-        any        -> return any
-    _ -> return status
+        LcbSuccess -> do
+          lcbToStatus <$> c_lcbInitWrapper prt
+          return (Right i)
+        any -> return $ Left any
+    any -> return $ Left any
 
-lcbAddCas :: Ptr () -> Maybe Int -> IO LcbStatus
-lcbAddCas _      Nothing  = return LcbSuccess
-lcbAddCas ptrCmd (Just x) = lcbToStatus <$> c_lcbCmdstoreCas ptrCmd (fromIntegral $ fromEnum x)
-
-lcbAddExpTime :: Ptr () -> Maybe Int -> IO LcbStatus
-lcbAddExpTime _      Nothing  = return LcbSuccess
-lcbAddExpTime ptrCmd (Just x) = lcbToStatus <$> c_lcbCmdstoreExpiry ptrCmd (fromIntegral $ fromEnum x)
-
-lcbStore :: (LcbValueOf a) => LcbInstance -> LcbStore a -> IO LcbStatus
-lcbStore (LcbInstance lcbInstance) (LcbStore op opts key value) = allocaBytes 152 $ \ptrCmd -> do
+lcbStore :: (LcbValueOf a) => LcbInstance -> LcbStore a -> IO (Either LcbStatus LcbResponse)
+lcbStore lcbInstance (LcbStore op opts key value) = allocaBytes 152 $ \ptrCmd -> do
   fillBytes ptrCmd 0 152
   (\ptr val -> pokeByteOff ptr 136 (val :: CInt)) ptrCmd $ fromIntegral $ fromEnum $ op
   withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdstoreKey ptrCmd _key (toEnum _key_len)
   B.useAsCStringLen (valueOf value) $ \(_value, _value_len) -> c_lcbCmdstoreValue ptrCmd _value (toEnum _value_len)
-  casResponse <- lcbAddCas ptrCmd (cas opts)
-  lcbAddExpTime ptrCmd (exptime opts)
+  casResponse <- lcbAddCas ptrCmd (cas opts) c_lcbCmdstoreCas
+  lcbAddExpTime ptrCmd (exptime opts) c_lcbCmdstoreExpiry
   case casResponse of
-    LcbSuccess -> allocaBytes 24 $ \responseInfo -> do
-      fillBytes responseInfo 0 24
-      withForeignPtr lcbInstance $ \prt -> c_lcbStoreWrapper prt ptrCmd responseInfo
-      LcbResponse status _ _ _ <- peek responseInfo
-      return $ lcbToStatus status
-    any -> return any
+    LcbSuccess ->
+      lcbRun lcbInstance ptrCmd c_lcbStoreWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
+    any -> return $ Left any
 
-lcbGet :: LcbInstance -> String -> IO (Either LcbStatus B.ByteString)
-lcbGet (LcbInstance lcbInstance) key = allocaBytes 112 $ \ptrCmd -> do
+lcbGet :: LcbInstance -> String -> IO (Either LcbStatus LcbResponse)
+lcbGet lcbInstance key = allocaBytes 112 $ \ptrCmd -> do
   fillBytes ptrCmd 0 112
   withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
-  allocaBytes 24 $ \responseInfo -> do
-    fillBytes responseInfo 0 24
-    withForeignPtr lcbInstance $ \prt -> c_lcbGetWrapper prt ptrCmd responseInfo
-    LcbResponse status _ length value <- peek responseInfo
-    case (lcbToStatus status) of
-      LcbSuccess -> Right <$> B.packCStringLen (value, fromEnum length)
-      any        -> return $ Left any
+  lcbRun lcbInstance ptrCmd c_lcbGetWrapper
+    $ \(LcbResponseRaw _ cas length value _) -> (fromIntegral cas, ) . Just <$> B.packCStringLen (value, fromEnum length)
 
+lcbTouch :: LcbInstance -> String -> Int -> IO (Either LcbStatus LcbResponse)
+lcbTouch lcbInstance key exptime = allocaBytes 112 $ \ptrCmd -> do
+  fillBytes ptrCmd 0 112
+  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
+  lcbAddExpTime ptrCmd (Just exptime) c_lcbCmdtouchExpiry
+  lcbRun lcbInstance ptrCmd c_lcbTouchWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
+
+lcbRemove :: LcbInstance -> String -> Maybe Int -> IO (Either LcbStatus LcbResponse)
+lcbRemove lcbInstance key cas = allocaBytes 112 $ \ptrCmd -> do
+  fillBytes ptrCmd 0 112
+  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdremoveKey ptrCmd _key (toEnum _key_len)
+  lcbAddCas ptrCmd cas c_lcbCmdremoveCas
+  lcbRun lcbInstance ptrCmd c_lcbRemoveWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
+
+lcbCounter :: LcbInstance -> String -> Int -> Int -> Maybe Int -> Maybe Int -> IO (Either LcbStatus (Int, Int))
+lcbCounter lcbInstance key defaultValue delta exptime cas = allocaBytes 128 $ \ptrCmd -> do
+  fillBytes ptrCmd 0 128
+  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdcounterKey ptrCmd _key (toEnum _key_len)
+  c_lcbCmdcounterInitital ptrCmd (fromIntegral $ fromEnum defaultValue)
+  c_lcbCmdcounterDelta ptrCmd (fromIntegral $ fromEnum delta)
+  lcbAddExpTime ptrCmd exptime c_lcbCmdtouchExpiry
+  lcbAddCas ptrCmd cas c_lcbCmdcounterCas
+  lcbRun lcbInstance ptrCmd c_lcbCounterWrapper
+    $ \(LcbResponseRaw _ cas _ _ value) -> return (fromIntegral cas, fromIntegral value)
+
+lcbRun
+  :: LcbInstance
+  -> Ptr ()
+  -> (Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ())
+  -> (LcbResponseRaw -> IO a)
+  -> IO (Either LcbStatus a)
+lcbRun (LcbInstance lcbInstance) ptrCmd cmd success = allocaBytes responseInfoSize $ \responseInfo -> do
+  fillBytes responseInfo 0 responseInfoSize
+  withForeignPtr lcbInstance $ \prt -> cmd prt ptrCmd responseInfo
+  response@(LcbResponseRaw status _ _ _ _) <- peek responseInfo
+  case lcbToStatus status of
+    LcbSuccess -> Right <$> success response
+    any        -> return $ Left any
+
+lcbAddCas :: Ptr () -> Maybe Int -> (Ptr () -> CULong -> IO CInt) -> IO LcbStatus
+lcbAddCas _      Nothing  _  = return LcbSuccess
+lcbAddCas ptrCmd (Just x) fn = lcbToStatus <$> fn ptrCmd (fromIntegral $ fromEnum x)
+
+lcbAddExpTime :: Ptr () -> Maybe Int -> (Ptr () -> CULong -> IO CInt) -> IO LcbStatus
+lcbAddExpTime _      Nothing  _  = return LcbSuccess
+lcbAddExpTime ptrCmd (Just x) fn = lcbToStatus <$> fn ptrCmd (fromIntegral $ fromEnum x)
+
+lbcStatusToError :: LcbStatus -> IO String
+lbcStatusToError status = c_lcbStrerrorLong (toEnum $ fromEnum status) >>= peekCString
 
 foreign import ccall "couchbase.h &lcb_destroy"
   lcb_destroy :: FinalizerPtr LcbInstance
@@ -265,24 +310,56 @@ foreign import ccall safe "couchbase.h lcb_cmdstore_key"
 foreign import ccall safe "couchbase.h lcb_cmdget_key"
   c_lcbCmdgetKey :: Ptr () -> Ptr CChar -> CInt -> IO ()
 
+foreign import ccall safe "couchbase.h lcb_cmdcounter_key"
+  c_lcbCmdcounterKey :: Ptr () -> Ptr CChar -> CInt -> IO ()
+
+foreign import ccall safe "couchbase.h lcb_cmdremove_key"
+  c_lcbCmdremoveKey :: Ptr () -> Ptr CChar -> CInt -> IO ()
+
 foreign import ccall safe "couchbase.h lcb_cmdstore_value"
   c_lcbCmdstoreValue :: Ptr () -> Ptr CChar -> CInt -> IO ()
 
+foreign import ccall safe "couchbase.h lcb_cmdcounter_initial"
+  c_lcbCmdcounterInitital :: Ptr () -> CULong -> IO ()
+
+foreign import ccall safe "couchbase.h lcb_cmdcounter_delta"
+  c_lcbCmdcounterDelta :: Ptr () -> CULong -> IO ()
+
+foreign import ccall safe "couchbase.h lcb_strerror_long"
+  c_lcbStrerrorLong :: CInt -> IO (Ptr CChar)
+
 foreign import ccall safe "couchbase.h lcb_cmdstore_cas"
-  c_lcbCmdstoreCas :: Ptr () -> CLong -> IO CInt
+  c_lcbCmdstoreCas :: Ptr () -> CULong -> IO CInt
+
+foreign import ccall safe "couchbase.h lcb_cmdremove_cas"
+  c_lcbCmdremoveCas :: Ptr () -> CULong -> IO CInt
+
+foreign import ccall safe "couchbase.h lcb_cmdcounter_cas"
+  c_lcbCmdcounterCas :: Ptr () -> CULong -> IO CInt
 
 foreign import ccall safe "couchbase.h lcb_cmdstore_expiry"
-  c_lcbCmdstoreExpiry :: Ptr () -> CInt -> IO CInt
+  c_lcbCmdstoreExpiry :: Ptr () -> CULong -> IO CInt
+
+foreign import ccall safe "couchbase.h lcb_cmdtouch_expiry"
+  c_lcbCmdtouchExpiry :: Ptr () -> CULong -> IO CInt
+
+foreign import ccall safe "couchbase.h lcb_cmdcounter_expiry"
+  c_lcbCmdcounterExpiry :: Ptr () -> CULong -> IO CInt
 
 foreign import ccall safe "couchbaseWrapper.h lcb_init_wrapper"
   c_lcbInitWrapper :: Ptr LcbInstance -> IO CInt
 
 foreign import ccall safe "couchbaseWrapper.h lcb_store_wrapper"
-  c_lcbStoreWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponse -> IO ()
+  c_lcbStoreWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ()
 
 foreign import ccall safe "couchbaseWrapper.h lcb_get_wrapper"
-  c_lcbGetWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponse -> IO ()
+  c_lcbGetWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ()
 
+foreign import ccall safe "couchbaseWrapper.h lcb_remove_wrapper"
+  c_lcbRemoveWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ()
 
+foreign import ccall safe "couchbaseWrapper.h lcb_touch_wrapper"
+  c_lcbTouchWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ()
 
-
+foreign import ccall safe "couchbaseWrapper.h lcb_counter_wrapper"
+  c_lcbCounterWrapper :: Ptr LcbInstance -> Ptr () -> Ptr LcbResponseRaw -> IO ()
