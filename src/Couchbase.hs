@@ -1,20 +1,20 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Couchbase
   ( CBConnect(..)
-  , CB_BucketType(..)
-  , LcbStoreOperation(..)
-  , LcbStore(..)
-  , StoreOpts(..)
+  , BucketType(..)
   , LcbValueOf(..)
-  , lcbCreate
+  , Lcb(..)
   , lcbConnect
-  , lcbStore
-  , lcbGet
-  , lcbRemove
-  , lcbTouch
-  , lcbCounter
+  , Remove(..)
+  , Touch(..)
+  , Get(..)
+  , Counter(..)
+  , Store(..)
+  , LcbInstance
   )
 where
 
@@ -26,7 +26,8 @@ import           Foreign.Storable
 import           Foreign.Marshal.Alloc
 import           Foreign.Marshal.Utils
 import           Foreign.C.String
-
+import qualified Data.Text                     as T
+import           Data.Text.Encoding             ( encodeUtf8 )
 import qualified Data.ByteString               as B
 import           LcbStatus
 import           Debug.Trace
@@ -34,9 +35,11 @@ import           GHC.TypeLits                   ( TypeError(..)
                                                 , ErrorMessage(..)
                                                 )
 
-data CB_BucketType = LcbTypeBucket
+data BucketType = LcbTypeBucket
                    | LcbTypeCluster
   deriving (Show,Eq)
+
+
 
 data LcbResponseRaw = LcbResponseRaw CInt CULong CUInt CString CULong
   deriving (Show, Eq)
@@ -63,6 +66,7 @@ data LcbWaitFlags = LcbWaitDefault | LcbWaitNoCheck
 
 class LcbValueOf a where
   valueOf :: a -> B.ByteString
+  toValue :: B.ByteString -> a
 
 data LcbStoreOperation = LcbUpsert
                        | LcbInsert
@@ -70,16 +74,6 @@ data LcbStoreOperation = LcbUpsert
                        | LcbAppend
                        | LcbPrepend
   deriving (Show,Eq)
-
-type Key = String
-
-data StoreOpts = StoreOpts {
-  cas :: Maybe Int,
-  exptime :: Maybe Int
-}
-
-data LcbStore a = LcbStore LcbStoreOperation StoreOpts Key a
-
 
 instance Enum LcbWaitFlags where
   succ LcbWaitDefault = LcbWaitNoCheck
@@ -141,7 +135,7 @@ instance Enum LcbStoreOperation where
   toEnum 5 = LcbPrepend
   toEnum unmatched = error ("LcbStoreOperation.toEnum: Cannot match " ++ show unmatched)
 
-instance Enum CB_BucketType where
+instance Enum BucketType where
   succ LcbTypeBucket = LcbTypeCluster
   succ LcbTypeCluster = error "CB_BucketType.succ: LcbTypeCluster has no successor"
 
@@ -167,6 +161,7 @@ instance Enum CB_BucketType where
 
 newtype LcbInstance = LcbInstance (ForeignPtr LcbInstance)
   deriving (Show, Eq)
+
 type LcbOps = Ptr ()
 type LcbCommand = Ptr ()
 
@@ -178,17 +173,58 @@ c_lcbCreate a2 = alloca $ \a1' ->
   c_lcbCreate'_ a1' a2 >>= \res -> let res' = (toEnum . fromIntegral) res in peekLcb a1' >>= \a1'' -> return (res', a1'')
 
 data CBConnect = CBConnect {
-    cb_bucket_type :: CB_BucketType,
+    cb_bucket_type :: BucketType,
     cb_username :: String,
     cb_password :: String,
     cb_connection :: String
 }
 
-type LcbResponse = (Int,Maybe B.ByteString)
+type Expire = Maybe Int
+type Cas = Maybe Int
+type Key = String
+type Delta = Int
+type Default = Int
+
+data Store a = Upsert Key a Expire
+             | Insert Key a Expire
+             | Replace Key a Expire Cas
+             | Append Key a Expire Cas
+             | Prepend Key a Expire Cas
+  deriving (Show,Eq)
+
+
+data Get = Get Key
+
+data Touch = Touch Key Expire
+
+data Remove = Remove Key Cas
+
+data Counter = Counter Key Default Delta Expire Cas
+
+class Lcb a where
+  lcb :: LcbInstance -> a -> IO (Either LcbStatus (Int,(Maybe B.ByteString)))
+
 
 responseInfoSize = sizeOf (undefined :: LcbResponseRaw)
 
 lcbToStatus = toEnum . fromIntegral
+
+lcbConnect :: CBConnect -> IO (Either LcbStatus LcbInstance)
+lcbConnect params = do
+  lcb <- lcbCreate params
+  case lcb of
+    Right (LcbInstance lcbInstance) -> withForeignPtr lcbInstance $ \prt -> do
+      status <- (toEnum . fromIntegral) <$> c_lcbConnect'_ prt
+      case status of
+        LcbSuccess -> do
+          waitStatus <- c_lcbWait prt (fromIntegral $ fromEnum LcbWaitNoCheck)
+          case lcbToStatus waitStatus of
+            LcbSuccess -> do
+              lcbToStatus <$> c_lcbInitWrapper prt
+              return lcb
+            any -> return $ Left any
+        any -> return $ Left any
+    Left _ -> return lcb
 
 lcbCreate :: CBConnect -> IO (Either LcbStatus LcbInstance)
 lcbCreate params = allocaBytes 96 $ \st -> do
@@ -203,63 +239,57 @@ lcbCreate params = allocaBytes 96 $ \st -> do
     LcbSuccess -> Right lcbInstance
     any        -> Left any
 
-lcbConnect :: LcbInstance -> IO (Either LcbStatus LcbInstance)
-lcbConnect i@(LcbInstance lcbInstance) = withForeignPtr lcbInstance $ \prt -> do
-  status <- (toEnum . fromIntegral) <$> c_lcbConnect'_ prt
-  case status of
-    LcbSuccess -> do
-      waitStatus <- c_lcbWait prt (fromIntegral $ fromEnum LcbWaitNoCheck)
-      case lcbToStatus waitStatus of
-        LcbSuccess -> do
-          lcbToStatus <$> c_lcbInitWrapper prt
-          return (Right i)
+instance (LcbValueOf a) => Lcb (Store a) where
+  lcb lcbInstance store = allocaBytes 152 $ \ptrCmd -> do
+      let (op, key, value, exptime, cas) = info store
+      fillBytes ptrCmd 0 152
+      (\ptr val -> pokeByteOff ptr 136 (val :: CInt)) ptrCmd $ fromIntegral $ fromEnum $ op
+      withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdstoreKey ptrCmd _key (toEnum _key_len)
+      B.useAsCStringLen (valueOf value) $ \(_value, _value_len) -> c_lcbCmdstoreValue ptrCmd _value (toEnum _value_len)
+      casResponse <- lcbAddCas ptrCmd cas c_lcbCmdstoreCas
+      lcbAddExpTime ptrCmd exptime c_lcbCmdstoreExpiry
+      case casResponse of
+        LcbSuccess ->
+          lcbRun lcbInstance ptrCmd c_lcbStoreWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
         any -> return $ Left any
-    any -> return $ Left any
+    where
+      info (Upsert key a exptime     ) = (LcbUpsert, key, a, exptime, Nothing)
+      info (Insert key a exptime     ) = (LcbInsert, key, a, exptime, Nothing)
+      info (Replace key a exptime cas) = (LcbReplace, key, a, exptime, cas)
+      info (Append  key a exptime cas) = (LcbAppend, key, a, exptime, cas)
+      info (Prepend key a exptime cas) = (LcbPrepend, key, a, exptime, cas)
 
-lcbStore :: (LcbValueOf a) => LcbInstance -> LcbStore a -> IO (Either LcbStatus LcbResponse)
-lcbStore lcbInstance (LcbStore op opts key value) = allocaBytes 152 $ \ptrCmd -> do
-  fillBytes ptrCmd 0 152
-  (\ptr val -> pokeByteOff ptr 136 (val :: CInt)) ptrCmd $ fromIntegral $ fromEnum $ op
-  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdstoreKey ptrCmd _key (toEnum _key_len)
-  B.useAsCStringLen (valueOf value) $ \(_value, _value_len) -> c_lcbCmdstoreValue ptrCmd _value (toEnum _value_len)
-  casResponse <- lcbAddCas ptrCmd (cas opts) c_lcbCmdstoreCas
-  lcbAddExpTime ptrCmd (exptime opts) c_lcbCmdstoreExpiry
-  case casResponse of
-    LcbSuccess ->
-      lcbRun lcbInstance ptrCmd c_lcbStoreWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
-    any -> return $ Left any
+instance Lcb Get where
+  lcb lcbInstance (Get key) = allocaBytes 112 $ \ptrCmd -> do
+    fillBytes ptrCmd 0 112
+    withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
+    lcbRun lcbInstance ptrCmd c_lcbGetWrapper
+      $ \(LcbResponseRaw _ cas length value _) -> (fromIntegral cas, ) . Just <$> B.packCStringLen (value, fromEnum length)
 
-lcbGet :: LcbInstance -> String -> IO (Either LcbStatus LcbResponse)
-lcbGet lcbInstance key = allocaBytes 112 $ \ptrCmd -> do
-  fillBytes ptrCmd 0 112
-  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
-  lcbRun lcbInstance ptrCmd c_lcbGetWrapper
-    $ \(LcbResponseRaw _ cas length value _) -> (fromIntegral cas, ) . Just <$> B.packCStringLen (value, fromEnum length)
+instance Lcb Touch where
+  lcb lcbInstance (Touch key exptime) = allocaBytes 112 $ \ptrCmd -> do
+    fillBytes ptrCmd 0 112
+    withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
+    lcbAddExpTime ptrCmd exptime c_lcbCmdtouchExpiry
+    lcbRun lcbInstance ptrCmd c_lcbTouchWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
 
-lcbTouch :: LcbInstance -> String -> Int -> IO (Either LcbStatus LcbResponse)
-lcbTouch lcbInstance key exptime = allocaBytes 112 $ \ptrCmd -> do
-  fillBytes ptrCmd 0 112
-  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdgetKey ptrCmd _key (toEnum _key_len)
-  lcbAddExpTime ptrCmd (Just exptime) c_lcbCmdtouchExpiry
-  lcbRun lcbInstance ptrCmd c_lcbTouchWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
+instance Lcb Remove where
+  lcb lcbInstance (Remove key cas) = allocaBytes 112 $ \ptrCmd -> do
+    fillBytes ptrCmd 0 112
+    withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdremoveKey ptrCmd _key (toEnum _key_len)
+    lcbAddCas ptrCmd cas c_lcbCmdremoveCas
+    lcbRun lcbInstance ptrCmd c_lcbRemoveWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
 
-lcbRemove :: LcbInstance -> String -> Maybe Int -> IO (Either LcbStatus LcbResponse)
-lcbRemove lcbInstance key cas = allocaBytes 112 $ \ptrCmd -> do
-  fillBytes ptrCmd 0 112
-  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdremoveKey ptrCmd _key (toEnum _key_len)
-  lcbAddCas ptrCmd cas c_lcbCmdremoveCas
-  lcbRun lcbInstance ptrCmd c_lcbRemoveWrapper $ \(LcbResponseRaw _ cas _ _ _) -> return (fromIntegral cas, Nothing)
-
-lcbCounter :: LcbInstance -> String -> Int -> Int -> Maybe Int -> Maybe Int -> IO (Either LcbStatus (Int, Int))
-lcbCounter lcbInstance key defaultValue delta exptime cas = allocaBytes 128 $ \ptrCmd -> do
-  fillBytes ptrCmd 0 128
-  withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdcounterKey ptrCmd _key (toEnum _key_len)
-  c_lcbCmdcounterInitital ptrCmd (fromIntegral $ fromEnum defaultValue)
-  c_lcbCmdcounterDelta ptrCmd (fromIntegral $ fromEnum delta)
-  lcbAddExpTime ptrCmd exptime c_lcbCmdtouchExpiry
-  lcbAddCas ptrCmd cas c_lcbCmdcounterCas
-  lcbRun lcbInstance ptrCmd c_lcbCounterWrapper
-    $ \(LcbResponseRaw _ cas _ _ value) -> return (fromIntegral cas, fromIntegral value)
+instance Lcb Counter where
+  lcb lcbInstance (Counter key defaultValue delta exptime cas) = allocaBytes 128 $ \ptrCmd -> do
+    fillBytes ptrCmd 0 128
+    withCAStringLen key $ \(_key, _key_len) -> c_lcbCmdcounterKey ptrCmd _key (toEnum _key_len)
+    c_lcbCmdcounterInitital ptrCmd (fromIntegral $ fromEnum defaultValue)
+    c_lcbCmdcounterDelta ptrCmd (fromIntegral $ fromEnum delta)
+    lcbAddExpTime ptrCmd exptime c_lcbCmdtouchExpiry
+    lcbAddCas ptrCmd cas c_lcbCmdcounterCas
+    lcbRun lcbInstance ptrCmd c_lcbCounterWrapper
+      $ \(LcbResponseRaw _ cas _ _ value) -> return (fromIntegral cas, Just $ encodeUtf8 $ T.pack $ show value)
 
 lcbRun
   :: LcbInstance
