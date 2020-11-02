@@ -348,10 +348,8 @@ main = hspec $ do
                     rseq queryResult2
                     return (queryResult1, queryResult2)
 
-              (count1, result1) <- result <$> queryResult1
-              (count2, result2) <- result <$> queryResult2
+              result1 <- result <$> queryResult1
+              result2 <- result <$> queryResult2
 
-              count1 `shouldBe` 1
-              head result1 `shouldBe` (last $ map snd keys)
-              count2 `shouldBe` 1
-              head result2 `shouldBe` (head $ map snd keys)
+              result1 `shouldBe` (1, [last $ map snd keys])
+              result2 `shouldBe` (1, [head $ map snd keys])

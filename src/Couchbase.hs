@@ -296,11 +296,9 @@ type Default = Int
 type Value = B.ByteString
 type Stmt = String
 type AdHoc = Bool
-data Options = Pretty Int
+data Options = Pretty Bool
              | ClientContextIndex String
   deriving (Show,Eq)
-
-
 
 data Store = Upsert Key Value Expire
            | Insert Key Value Expire
@@ -477,6 +475,8 @@ instance Lcb Query (Cas,[B.ByteString]) where
     mapM_ (nameParameters cmd) (namedParams opts)
     mapM_ (positionalParameters cmd) (posParams opts)
     addConsistency cmd (consistency opts)
+    addAdHoc cmd (adhoc opts)
+    mapM_ (addOption cmd) (options opts)
     c_lcbCmdqueryMetrics cmd 0
     response <- lcbRun lcbInstance (sizeOf (undefined :: QueryResult)) cmd c_lcbQueryWrapper
       $ \(QueryResult _ result_no _ value) -> do
@@ -485,6 +485,12 @@ instance Lcb Query (Cas,[B.ByteString]) where
     c_lcbCmdqueryDestroy cmd
     return response
    where
+
+    addOption cmd (Pretty pretty) = c_lcbCmdqueryPretty cmd (fromIntegral $ fromEnum pretty)
+    addOption cmd (ClientContextIndex context) = withCAStringLen context $ \(_cxt, _cxt_len) -> c_lcbCmdqueryClientContextId cmd _cxt (toEnum _cxt_len)
+
+    addAdHoc _ Nothing  = return (fromIntegral $ fromEnum LcbSuccess)
+    addAdHoc cmd (Just adhoc) = c_lcbCmdqueryAdhoc cmd (fromIntegral $ fromEnum adhoc)
 
     addConsistency _ Nothing = return (fromIntegral $ fromEnum LcbSuccess)
     addConsistency cmd (Just consistency) = c_lcbCmdqueryConsistency cmd (fromIntegral $ fromEnum consistency)
@@ -621,8 +627,14 @@ foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_positional_param"
 foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_consistency"
   c_lcbCmdqueryConsistency :: Ptr () -> CInt -> IO CInt
 
-foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_option"
-  c_lcbCmdqueryOption :: Ptr () -> Ptr CChar -> CInt -> Ptr CChar -> CInt -> IO CInt
+foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_pretty"
+  c_lcbCmdqueryPretty :: Ptr () -> CInt -> IO CInt
+
+foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_client_context_id"
+  c_lcbCmdqueryClientContextId :: Ptr () -> Ptr CChar -> CInt -> IO CInt
+
+foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_adhoc"
+  c_lcbCmdqueryAdhoc :: Ptr () -> CInt -> IO CInt
 
 foreign import ccall safe "couchbaseWrapper.h lcb_cmdquery_metrics"
   c_lcbCmdqueryMetrics :: Ptr () -> CInt -> IO CInt
