@@ -30,10 +30,10 @@ couchbase-cli bucket-create -c $CB_URL -u "${CB_USER}" -p "${CB_PASS}" --bucket=
 
 sleep 3
 
-couchbase-cli user-manage -c 127.0.0.1:8091 -u "${CB_USER}" -p "${CB_PASS}" --set --rbac-username $CB_USER_NAME --rbac-password $CB_USER_PWD --rbac-name $CB_USER_NAME --roles data_reader[$CB_BUCKET_NAME],data_writer[$CB_BUCKET_NAME],query_select[$CB_BUCKET_NAME],query_update[$CB_BUCKET_NAME],query_insert[$CB_BUCKET_NAME],query_delete[$CB_BUCKET_NAME] --auth-domain local
+couchbase-cli user-manage -c 127.0.0.1:8091 -u "${CB_USER}" -p "${CB_PASS}" --set --rbac-username $CB_USER_NAME --rbac-password $CB_USER_PWD --rbac-name $CB_USER_NAME --roles bucket_full_access[$CB_BUCKET_NAME] --auth-domain local
 
 sleep 15
-curl -i -u $CB_USER:$CB_PASS -X POST http://$CB_URL/settings/indexes -d 'storageMode=plasma'
+curl -i -u $CB_USER:$CB_PASS -X POST http://$CB_URL/settings/indexes -d 'storageMode=forestdb'
 
 sleep 3
 
