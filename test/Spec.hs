@@ -24,7 +24,7 @@ import qualified Data.Set                      as S
 import           Control.Parallel.Strategies
 
 defaultParams :: CBConnect
-defaultParams = cbConnect "gianluca" "qwerty12345" "couchbase://localhost/test"
+defaultParams = cbConnect "honest" "qwerty12345" "couchbase://localhost/test"
 
 cbConnect username password connection =
   CBConnect {cb_bucket_type = LcbTypeBucket, cb_username = username, cb_password = password, cb_connection = connection}
@@ -98,7 +98,7 @@ main = hspec $ do
         it "should not connect" $ \_ -> do
           errorCode
             <$>            lcbConnect (cbConnect "gianluca" "qwerty12345" "couchbase://localhost/not_found")
-            `shouldReturn` LcbErrGeneric
+            `shouldReturn` LcbErrAuthenticationFailure
 
   describe "Insert" $ do
 
