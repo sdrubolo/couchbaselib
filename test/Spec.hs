@@ -118,7 +118,7 @@ main = hspec $ do
         it "should fail" $ \connection -> do
           withKey $ \key -> do
             doc <- document
-            let op = Insert key (toByteString $ show 1) Nothing
+            let op = Insert key (toByteString "1") Nothing
             Right _ <- lcb connection (Insert key doc Nothing)
             errorCode <$> lcb connection op `shouldReturn` LcbErrDocumentExists
 
